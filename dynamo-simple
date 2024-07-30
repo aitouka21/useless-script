@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+profile='default'
+table=
+
+while getopts "p:t:" arg; do
+  case $arg in
+    p)  profile="$OPTARG"
+    ;;
+    t)  table="$OPTARG" 
+    ;;
+  esac
+done
+
+if [[ -z "${table}" ]]; then
+  table=$(aws dynamodb list-tables --profile "${profile}" | jq -rc '.TableNames[]' | fzf)
+fi
+
+table_info=$(aws dynamodb describe-table --profile "${profile}" --table-name "${table}")
+
+options=$(jq -rc '
+  ("[GET]" + (.Table.KeySchema | map("[" + (.KeyType) + ":" + (.AttributeName) + "]") | join(""))),
+  ("[QUERY]" + (.Table.KeySchema | map("[" + (.KeyType) + ":" + (.AttributeName) + "]") | join(""))),
+  (.Table.GlobalSecondaryIndexes // [] 
+    | .[] 
+    | ("[QUERY]" + "[INDEX:" + .IndexName + "]" + (.KeySchema | map("[" + (.KeyType) + ":" + (.AttributeName) + "]") | join("")) )
+  ),
+  ("[SCAN]"),
+  (.Table.GlobalSecondaryIndexes // []
+    | .[]
+    | ("[SCAN]" + "[INDEX:" + .IndexName + "]")
+  )
+  ' <<< "${table_info}")
+
+selected=$(fzf --exact <<< "${options}")
+
+action=$(perl -ne 'print $1 if /\[(QUERY|GET|SCAN)\]/' <<< "${selected}")
+
+if [[ $action == "GET" ]]; then
+  hash_key=$(perl -ne 'print $1 if /\[HASH:(.*?)\]/' <<< "${selected}")
+  hash_key_type=$(jq -r --arg 'an' "${hash_key}" '.Table.AttributeDefinitions[] | select(.AttributeName == $an) | .AttributeType' <<< ${table_info})
+  read -p "${hash_key}: " hash_key_value
+  if [[ -z "${hash_key_value}" ]]; then
+    echo "[Error] ${hash_key} must be set" && exit 1
+  fi
+
+  key=$(jq -nc \
+    --arg 'hash_key' "${hash_key}" \
+    --arg 'hash_key_type' "${hash_key_type}" \
+    --arg 'hash_key_value' "${hash_key_value}" \
+    '{ ($hash_key): { ($hash_key_type): $hash_key_value } }')
+
+  range_key=$(perl -ne 'print $1 if /\[RANGE:(.*?)\]/' <<< "${selected}")
+  if [[ -n "${range_key}" ]]; then
+    range_key_type=$(jq -r --arg 'an' "${hash_key}" '.Table.AttributeDefinitions[] | select(.AttributeName == $an) | .AttributeType' <<< "${table_info}")
+
+    read -p "${range_key}: " range_key_value
+    if [[ -z "${range_key_value}" ]]; then
+      echo "[Error] "${range_key}" must be set" && exit 1
+    fi
+
+    key=$(jq -rc \
+      --arg 'range_key' "${range_key}" \
+      --arg 'range_key_type' "${range_key_type}" \
+      --arg 'range_key_value' "${range_key_value}" \
+      '.[$range_key].[$range_key_type] = $range_key_value' <<< "${key}")
+  fi
+  
+  result=$(aws dynamodb get-item --profile "${profile}" --table-name "${table}" --key "${key}")
+  jq '.Item | decode_ddb' <<< "${result}"
+  exit 0
+fi
+
+if [[ $action == "QUERY" ]]; then
+  hash_key=$(perl -ne 'print $1 if /\[HASH:(.*?)\]/' <<< "${selected}")
+  hash_key_type=$(jq -r --arg 'an' "${hash_key}" '.Table.AttributeDefinitions[] | select(.AttributeName == $an) | .AttributeType' <<< "${table_info}")
+
+  read -p "${hash_key}: " hash_key_value
+  if [[ -z "${hash_key_value}" ]]; then
+    echo "[Error] ${hash_key} must be set" && exit 1
+  fi
+
+  key_condition_expression="#pk = :pk"
+  expression_attribute_names=$(jq -nc --arg 'hash_key' "${hash_key}" '{ "#pk": $hash_key }')
+  expression_attribute_values=$(jq -nc --arg 'hash_key_type' "${hash_key_type}" --arg 'hash_key_value' "${hash_key_value}" '{ ":pk": { ($hash_key_type): $hash_key_value } }')
+
+
+  args=(
+    --profile "${profile}"
+    --table-name "${table}"
+    --key-condition-expression "${key_condition_expression}" 
+    --expression-attribute-names "${expression_attribute_names}"
+    --expression-attribute-values "${expression_attribute_values}")
+
+  index_name=$(perl -ne 'print $1 if /\[INDEX:(.*?)\]/' <<< "${selected}")
+  if [[ -n "${index_name}" ]]; then
+    args+=(--index-name "${index_name}")
+  fi
+
+  # TODO: support range key condition expression
+
+  result=$(aws dynamodb query "${args[@]}")
+  jq '.Items | decode_ddb' <<< "${result}"
+  exit 0
+fi
+
+if [[ $action == "SCAN" ]]; then
+  read -p 'limit(optional): ' limit
+
+  args=(
+    --profile "${profile}"
+    --table-name "${table}"
+    )
+
+  index_name=$(perl -ne 'print $1 if /\[INDEX:(.*?)\]/' <<< "${selected}")
+  if [[ -n "${index_name}" ]]; then
+    args+=(--index-name "${index_name}")
+  fi
+
+  if [[ -n "${limit}" ]]; then
+    args+=(--limit "${limit}")
+  fi
+
+  result=$(aws dynamodb scan "${args[@]}")
+  jq '.Items | decode_ddb' <<< "${result}"
+  exit 0
+fi
+
+echo "Unsupported action"
+exit 1
+
